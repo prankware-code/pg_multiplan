@@ -36,11 +36,17 @@ static bool cache_loaded = false;
 static bool enable_caching = false;
 static bool enable_contrib = false;
 
+typedef struct CachedPlanEntry
+{
+	PlannedStmt	*stmt;
+	Query		*query;
+	char		*query_text;
+} CachedPlanEntry;
+
 typedef struct PlanHashEntry
 {
 	uint64 queryId;
 	List *plans_list;
-	char *query;
 	int64 selected;
 } PlanHashEntry;
 
@@ -77,36 +83,44 @@ load_plans_from_table(void)
 
     while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
     {
-        Datum   d_qid, d_qtext, d_pdata;
+        Datum   d_qid, d_qtext, d_pdata, d_qtree;
 		// Datum d_plan_id;
         bool    isnull;
         uint64  query_id;
-        char   *plan_str, *query_str;
+        char	*plan_str, *query_str, *query_tree_str;
         PlannedStmt *plan;
         PlanHashEntry *entry;
         bool    found;
+		CachedPlanEntry *cached_plan;
 
         d_qid   = heap_getattr(tup, 1, tupdesc, &isnull);
+		d_qtree = heap_getattr(tup, 2, tupdesc, &isnull);
         // d_plan_id = heap_getattr(tup, 2, tupdesc, &isnull);
-        d_qtext = heap_getattr(tup, 3, tupdesc, &isnull);
-        d_pdata = heap_getattr(tup, 4, tupdesc, &isnull);
+        d_qtext = heap_getattr(tup, 4, tupdesc, &isnull);
+        d_pdata = heap_getattr(tup, 5, tupdesc, &isnull);
 
         query_id = strtoull(text_to_cstring(DatumGetTextPP(d_qid)), NULL, 10);
         plan_str = text_to_cstring(DatumGetTextPP(d_pdata));
+		query_tree_str = text_to_cstring(DatumGetTextPP(d_qtree));
         query_str = text_to_cstring(DatumGetTextPP(d_qtext));
 
         oldctx = MemoryContextSwitchTo(plan_cache_ctx);
 
         plan = (PlannedStmt *) stringToNode(plan_str);
 
+		cached_plan = palloc(sizeof(CachedPlanEntry));
+		cached_plan->query = (Query *) stringToNode(query_tree_str);
+		cached_plan->query_text = pstrdup(query_str);
+		cached_plan->stmt = plan;
+
         entry = hash_search(hashed_plans, &query_id, HASH_ENTER, &found);
         if (!found)
         {
             entry->plans_list = NIL;
             entry->selected = 1;
-            entry->query = pstrdup(query_str);
         }
-        entry->plans_list = lappend(entry->plans_list, plan);
+
+        entry->plans_list = lappend(entry->plans_list, cached_plan);
 
         MemoryContextSwitchTo(oldctx);
     }
@@ -116,14 +130,14 @@ load_plans_from_table(void)
 }
 
 static void
-persist_plan(uint64 query_id, int64 plan_id,
+persist_plan(uint64 query_id, const char *query_tree, int64 plan_id,
              const char *query_text, const char *plan_data)
 {
     RangeVar   *rv;
     Oid         relid;
     Relation    rel;
-    Datum       values[5];
-    bool        nulls[5] = {false, false, false, false, false};
+    Datum       values[6];
+    bool        nulls[6] = {false, false, false, false, false, false};
     HeapTuple   tup;
     char        qid_buf[32];
 
@@ -135,10 +149,11 @@ persist_plan(uint64 query_id, int64 plan_id,
     rel = table_open(relid, RowExclusiveLock);
 
     values[0] = CStringGetTextDatum(qid_buf);
-    values[1] = Int64GetDatum(plan_id);
-    values[2] = CStringGetTextDatum(query_text);
-    values[3] = CStringGetTextDatum(plan_data);
-    values[4] = BoolGetDatum(false);
+	values[1] = CStringGetTextDatum(query_tree);
+    values[2] = Int64GetDatum(plan_id);
+    values[3] = CStringGetTextDatum(query_text);
+    values[4] = CStringGetTextDatum(plan_data);
+    values[5] = BoolGetDatum(false);
 
     tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
@@ -246,7 +261,7 @@ pg_multiplan_list(PG_FUNCTION_ARGS)
 
 	foreach(lc, hash_entry->plans_list)
 	{
-		PlannedStmt *entry = (PlannedStmt *) lfirst(lc);
+		CachedPlanEntry *entry = (CachedPlanEntry *) lfirst(lc);
 		Datum	values[5];
 		bool	nulls[5] = {false, false, false, false, false};
 
@@ -256,8 +271,8 @@ pg_multiplan_list(PG_FUNCTION_ARGS)
 
 		values[0] = Int64GetDatum(plan_id++);
 		values[1] = CStringGetTextDatum(qid_buf);
-		values[2] = Float8GetDatum(entry->planTree->total_cost);
-		values[3] = CStringGetTextDatum(hash_entry->query);
+		values[2] = Float8GetDatum(entry->stmt->planTree->total_cost);
+		values[3] = CStringGetTextDatum(entry->query_text);
 		values[4] = BoolGetDatum(is_selected);
 
 		tuplestore_putvalues(tupstore, tupledesc, values, nulls);
@@ -305,51 +320,69 @@ multiplan_planner_hook(Query *parse,
 	PlanHashEntry *hash_entry = NULL;
 	bool hash_found = false;
 	PlannedStmt *result = NULL;
+	Query		*query_copy;
+	CachedPlanEntry *cached_plan;
 
-	if (enable_contrib && !cache_loaded)
-    {
-        load_plans_from_table();
-        cache_loaded = true;
-    }
+	if (!enable_contrib || boundParams != NULL)
+		return get_standart_plan(parse, query_string, cursorOptions,
+								 boundParams, es);
 
-	if (parse->queryId  == INT64CONST(0))
+	if (!cache_loaded)
+	{
+		load_plans_from_table();
+		cache_loaded = true;
+	}
+
+	if (parse->queryId == INT64CONST(0))
 		JumbleQuery(parse);
 
-	elog(NOTICE, "query = %s, query_id = %lu", query_string, parse->queryId);
+	query_copy = copyObject(parse);
+
+	if (!enable_caching)
+	{
+		hash_entry = (PlanHashEntry *) hash_search(hashed_plans, &parse->queryId,
+												   HASH_FIND, &hash_found);
+
+		if (hash_found &&
+			hash_entry->selected >= 1 &&
+			hash_entry->selected <= list_length(hash_entry->plans_list))
+		{
+			cached_plan =
+				list_nth(hash_entry->plans_list, hash_entry->selected - 1);
+
+			if (equal(cached_plan->query, parse))
+				return copyObject(cached_plan->stmt);
+		}
+
+		return get_standart_plan(parse, query_string, cursorOptions,
+								 boundParams, es);
+	}
+
+	result = get_standart_plan(parse, query_string, cursorOptions,
+							   boundParams, es);
 
 	oldctx = MemoryContextSwitchTo(plan_cache_ctx);
 
-	hash_entry = (PlanHashEntry *) hash_search(hashed_plans, &parse->queryId, HASH_ENTER, &hash_found);
-
+	hash_entry = (PlanHashEntry *) hash_search(hashed_plans, &parse->queryId,
+											   HASH_ENTER, &hash_found);
 	if (!hash_found)
 	{
 		hash_entry->plans_list = NIL;
 		hash_entry->selected = 1;
-		hash_entry->query = NULL;
 	}
 
-	if (enable_contrib && enable_caching)
-	{
-		char *serialized_plan = NULL;
-		result = get_standart_plan(parse, query_string, cursorOptions, boundParams, es);
-
-		hash_entry->plans_list = lappend(hash_entry->plans_list, copyObject(result));
-		hash_entry->query = pstrdup(query_string);
-
-		serialized_plan = nodeToString(result);
-		persist_plan(parse->queryId, list_length(hash_entry->plans_list), query_string, serialized_plan);
-
-		last_query_id = parse->queryId;
-	}
-	else
-	{
-		if (enable_contrib && !hash_entry->plans_list)
-			result = get_standart_plan(parse, query_string, cursorOptions, boundParams, es);
-		else
-			result = (PlannedStmt *) list_nth(hash_entry->plans_list, hash_entry->selected - 1);
-	}
+	cached_plan = palloc(sizeof(CachedPlanEntry));
+	cached_plan->stmt = copyObject(result);
+	cached_plan->query = copyObject(query_copy);
+	cached_plan->query_text = pstrdup(query_string);
+	hash_entry->plans_list = lappend(hash_entry->plans_list, cached_plan);
 
 	MemoryContextSwitchTo(oldctx);
+
+	persist_plan(parse->queryId, nodeToString(query_copy), list_length(hash_entry->plans_list),
+				 query_string, nodeToString(result));
+
+	last_query_id = parse->queryId;
 
 	return result;
 }

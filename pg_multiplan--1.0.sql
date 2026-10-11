@@ -2,6 +2,7 @@
 
 CREATE TABLE pg_multiplan_plans (
     query_id    text NOT NULL,
+	query_tree	text NOT NULL,
     plan_id     bigint NOT NULL,
     query_text  text,
     plan_data   text NOT NULL,
