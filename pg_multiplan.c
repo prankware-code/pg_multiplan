@@ -30,6 +30,18 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pg_multiplan_list);
 PG_FUNCTION_INFO_V1(pg_multiplan_select);
 
+enum
+{
+	Anum_pg_multiplan_plans_query_id = 1,
+	Anum_pg_multiplan_plans_query_tree,
+	Anum_pg_multiplan_plans_plan_id,
+	Anum_pg_multiplan_plans_query_text,
+	Anum_pg_multiplan_plans_plan_data,
+	Anum_pg_multiplan_plans_selected,
+
+	Natts_pg_multiplan_plans = 6 /* number of columns */
+};
+
 static MemoryContext plan_cache_ctx = NULL;
 static planner_hook_type prev_planner_hook = NULL;
 static HTAB *hashed_plans = NULL;
@@ -121,16 +133,46 @@ load_plans_from_table(void)
         bool    found;
 		CachedPlanEntry *cached_plan;
 
-        d_qid   = heap_getattr(tup, 1, tupdesc, &isnull);
-		d_qtree = heap_getattr(tup, 2, tupdesc, &isnull);
-        // d_plan_id = heap_getattr(tup, 2, tupdesc, &isnull);
-        d_qtext = heap_getattr(tup, 4, tupdesc, &isnull);
-        d_pdata = heap_getattr(tup, 5, tupdesc, &isnull);
+        d_qid   = heap_getattr(tup, Anum_pg_multiplan_plans_query_id, tupdesc, &isnull);
+
+		if (isnull)
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					errmsg("skipping plan with null \"%s\" in table \"pg_multiplan_plans\"",
+							"query_id")));
+			continue;
+		}
+
+		d_qtree = heap_getattr(tup, Anum_pg_multiplan_plans_query_tree, tupdesc, &isnull);
+
+		if (isnull)
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					errmsg("skipping plan with null \"%s\" in table \"pg_multiplan_plans\"",
+							"query_tree")));
+			continue;
+		}
+
+        // d_plan_id = heap_getattr(tup, Anum_pg_multiplan_plans_plan_id, tupdesc, &isnull);
+		d_pdata = heap_getattr(tup, Anum_pg_multiplan_plans_plan_data, tupdesc, &isnull);
+		
+		if (isnull)
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					errmsg("skipping plan with null \"%s\" in table \"pg_multiplan_plans\"",
+							"plan_data")));
+			continue;
+		}
+
+        d_qtext = heap_getattr(tup, Anum_pg_multiplan_plans_query_text, tupdesc, &isnull);
 
         query_id = strtoull(text_to_cstring(DatumGetTextPP(d_qid)), NULL, 10);
         plan_str = text_to_cstring(DatumGetTextPP(d_pdata));
 		query_tree_str = text_to_cstring(DatumGetTextPP(d_qtree));
-        query_str = text_to_cstring(DatumGetTextPP(d_qtext));
+        query_str = isnull ? NULL : text_to_cstring(DatumGetTextPP(d_qtext));
 
         oldctx = MemoryContextSwitchTo(plan_cache_ctx);
 
@@ -138,7 +180,7 @@ load_plans_from_table(void)
 
 		cached_plan = palloc(sizeof(CachedPlanEntry));
 		cached_plan->query = (Query *) stringToNode(query_tree_str);
-		cached_plan->query_text = pstrdup(query_str);
+		cached_plan->query_text = query_str ? pstrdup(query_str) : NULL;
 		cached_plan->stmt = plan;
 
         entry = hash_search(hashed_plans, &query_id, HASH_ENTER, &found);
@@ -163,8 +205,8 @@ persist_plan(uint64 query_id, const char *query_tree, int64 plan_id,
 {
     Oid         relid;
     Relation    rel;
-    Datum       values[6];
-    bool        nulls[6] = {false, false, false, false, false, false};
+    Datum       values[Natts_pg_multiplan_plans];
+    bool        nulls[Natts_pg_multiplan_plans] = {0};
     HeapTuple   tup;
     char        qid_buf[32];
 
@@ -180,12 +222,15 @@ persist_plan(uint64 query_id, const char *query_tree, int64 plan_id,
 
     rel = table_open(relid, RowExclusiveLock);
 
-    values[0] = CStringGetTextDatum(qid_buf);
-	values[1] = CStringGetTextDatum(query_tree);
-    values[2] = Int64GetDatum(plan_id);
-    values[3] = CStringGetTextDatum(query_text);
-    values[4] = CStringGetTextDatum(plan_data);
-    values[5] = BoolGetDatum(false);
+    values[Anum_pg_multiplan_plans_query_id - 1] = CStringGetTextDatum(qid_buf);
+	values[Anum_pg_multiplan_plans_query_tree - 1] = CStringGetTextDatum(query_tree);
+    values[Anum_pg_multiplan_plans_plan_id - 1] = Int64GetDatum(plan_id);
+	if (query_text)
+		values[Anum_pg_multiplan_plans_query_text - 1] = CStringGetTextDatum(query_text);
+	else
+		nulls[Anum_pg_multiplan_plans_query_text - 1] = true;
+    values[Anum_pg_multiplan_plans_plan_data - 1] = CStringGetTextDatum(plan_data);
+    values[Anum_pg_multiplan_plans_selected - 1] = BoolGetDatum(false);
 
     tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
@@ -295,7 +340,7 @@ pg_multiplan_list(PG_FUNCTION_ARGS)
 	{
 		CachedPlanEntry *entry = (CachedPlanEntry *) lfirst(lc);
 		Datum	values[5];
-		bool	nulls[5] = {false, false, false, false, false};
+		bool	nulls[5] = {0};
 
 		bool	is_selected = (hash_entry->selected == plan_id);
 		char	qid_buf[32];
@@ -304,7 +349,10 @@ pg_multiplan_list(PG_FUNCTION_ARGS)
 		values[0] = Int64GetDatum(plan_id++);
 		values[1] = CStringGetTextDatum(qid_buf);
 		values[2] = Float8GetDatum(entry->stmt->planTree->total_cost);
-		values[3] = CStringGetTextDatum(entry->query_text);
+		if (entry->query_text)
+			values[3] = CStringGetTextDatum(entry->query_text);
+		else
+			nulls[3] = true;
 		values[4] = BoolGetDatum(is_selected);
 
 		tuplestore_putvalues(tupstore, tupledesc, values, nulls);
@@ -406,7 +454,7 @@ multiplan_planner_hook(Query *parse,
 	cached_plan = palloc(sizeof(CachedPlanEntry));
 	cached_plan->stmt = copyObject(result);
 	cached_plan->query = copyObject(query_copy);
-	cached_plan->query_text = pstrdup(query_string);
+	cached_plan->query_text = query_string ? pstrdup(query_string) : NULL;
 	hash_entry->plans_list = lappend(hash_entry->plans_list, cached_plan);
 
 	MemoryContextSwitchTo(oldctx);
