@@ -1,7 +1,10 @@
 #include "postgres.h"
 #include "access/table.h"
 #include "access/heapam.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
+#include "commands/extension.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "optimizer/planner.h"
@@ -14,6 +17,7 @@
 #include "utils/plancache.h"
 #include "utils/rel.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
@@ -59,10 +63,35 @@ multiplan_planner_hook(Query *parse,
 					   ParamListInfo boundParams,
 					   ExplainState *es);
 
+static Oid
+get_plans_relid(void)
+{
+	Oid extension_relid;
+	Oid schema_relid;
+	Oid	relname_relid;
+
+	extension_relid = get_extension_oid("pg_multiplan", true);
+
+	if (!OidIsValid(extension_relid))
+		return InvalidOid;
+	
+	schema_relid = get_extension_schema(extension_relid);
+
+	if (!OidIsValid(schema_relid))
+		return InvalidOid;
+
+	relname_relid = get_relname_relid("pg_multiplan_plans", schema_relid);
+
+	if (!OidIsValid(relname_relid)
+		|| getExtensionOfObject(RelationRelationId, relname_relid) != extension_relid)
+		return InvalidOid;
+	
+	return relname_relid;
+}
+
 static void
 load_plans_from_table(void)
 {
-    RangeVar      *rv;
     Oid            relid;
     Relation       rel;
     TableScanDesc  scan;
@@ -70,8 +99,7 @@ load_plans_from_table(void)
     TupleDesc      tupdesc;
     MemoryContext  oldctx;
 
-    rv = makeRangeVar(NULL, "pg_multiplan_plans", -1);
-    relid = RangeVarGetRelid(rv, AccessShareLock, true);
+    relid = get_plans_relid();
 
     if (!OidIsValid(relid))
         return;
@@ -133,7 +161,6 @@ static void
 persist_plan(uint64 query_id, const char *query_tree, int64 plan_id,
              const char *query_text, const char *plan_data)
 {
-    RangeVar   *rv;
     Oid         relid;
     Relation    rel;
     Datum       values[6];
@@ -143,8 +170,13 @@ persist_plan(uint64 query_id, const char *query_tree, int64 plan_id,
 
     snprintf(qid_buf, sizeof(qid_buf), UINT64_FORMAT, query_id);
 
-    rv = makeRangeVar(NULL, "pg_multiplan_plans", -1);
-    relid = RangeVarGetRelid(rv, RowExclusiveLock, false);
+    relid = get_plans_relid();
+
+	if (!OidIsValid(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("extension \"pg_multiplan\" is not installed in this database"),
+				 errhint("Run CREATE EXTENSION pg_multiplan, or turn off pg_multiplan.enable_caching.")));
 
     rel = table_open(relid, RowExclusiveLock);
 

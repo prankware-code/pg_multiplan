@@ -9,6 +9,9 @@ CREATE TABLE pg_multiplan_plans (
     selected    boolean DEFAULT false
 );
 
+-- plans are deserialized and executed as is, only the owner may write them
+REVOKE ALL ON pg_multiplan_plans FROM PUBLIC;
+
 CREATE FUNCTION pg_multiplan_list(
 	OUT plan_id		bigint,
     OUT query_id	text,
