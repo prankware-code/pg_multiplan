@@ -102,7 +102,26 @@ get_plans_relid(void)
 	return relname_relid;
 }
 
-static void
+/* the table lives in ctx and goes away together with it */
+static HTAB *
+create_plans_hash(MemoryContext ctx)
+{
+	HASHCTL		ctl;
+
+	ctl.keysize = sizeof(uint64);
+	ctl.entrysize = sizeof(PlanHashEntry);
+	ctl.hcxt = ctx;
+
+	return hash_create("pg_multiplan hash table", 128, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/*
+ * Plans are loaded into a fresh context and swapped in only on success, so an
+ * error halfway leaves the old cache intact.  Returns false if there is no
+ * table to load from (extension not created yet).
+ */
+static bool
 load_plans_from_table(void)
 {
 	Oid				relid;
@@ -111,12 +130,20 @@ load_plans_from_table(void)
 	HeapTuple		tup;
 	TupleDesc		tupdesc;
 	MemoryContext	oldctx;
+	MemoryContext	caller_ctx = CurrentMemoryContext;
+	MemoryContext	new_ctx;
+	HTAB		   *new_hash;
 	bool			snapshot_set = false;
 
 	relid = get_plans_relid();
 
 	if (!OidIsValid(relid))
-		return;
+		return false;
+
+	/* created before PG_TRY, so no need for volatile in PG_CATCH */
+	new_ctx = AllocSetContextCreate(TopMemoryContext, "pg_multiplan cache",
+									ALLOCSET_DEFAULT_SIZES);
+	new_hash = create_plans_hash(new_ctx);
 
 	if (!ActiveSnapshotSet())
 	{
@@ -124,91 +151,110 @@ load_plans_from_table(void)
 		snapshot_set = true;
 	}
 
-	rel = table_open(relid, AccessShareLock);
-	tupdesc = RelationGetDescr(rel);
-
-	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL, SO_NONE);
-
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	PG_TRY();
 	{
-		Datum   d_qid, d_qtext, d_pdata, d_qtree;
-		// Datum d_plan_id;
-		bool    isnull;
-		uint64  query_id;
-		char	*plan_str, *query_str, *query_tree_str;
-		PlannedStmt *plan;
-		PlanHashEntry *entry;
-		bool    found;
-		CachedPlanEntry *cached_plan;
+		rel = table_open(relid, AccessShareLock);
+		tupdesc = RelationGetDescr(rel);
 
-		d_qid   = heap_getattr(tup, Anum_pg_multiplan_plans_query_id, tupdesc, &isnull);
+		scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL, SO_NONE);
 
-		if (isnull)
+		while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
 		{
-			ereport(WARNING,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					errmsg("skipping plan with null \"%s\" in table \"pg_multiplan_plans\"",
-							"query_id")));
-			continue;
+			Datum   d_qid, d_qtext, d_pdata, d_qtree;
+			// Datum d_plan_id;
+			bool    isnull;
+			uint64  query_id;
+			char	*plan_str, *query_str, *query_tree_str;
+			PlannedStmt *plan;
+			PlanHashEntry *entry;
+			bool    found;
+			CachedPlanEntry *cached_plan;
+
+			d_qid   = heap_getattr(tup, Anum_pg_multiplan_plans_query_id, tupdesc, &isnull);
+
+			if (isnull)
+			{
+				ereport(WARNING,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("skipping plan with null \"%s\" in table \"pg_multiplan_plans\"",
+								"query_id")));
+				continue;
+			}
+
+			d_qtree = heap_getattr(tup, Anum_pg_multiplan_plans_query_tree, tupdesc, &isnull);
+
+			if (isnull)
+			{
+				ereport(WARNING,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("skipping plan with null \"%s\" in table \"pg_multiplan_plans\"",
+								"query_tree")));
+				continue;
+			}
+
+			// d_plan_id = heap_getattr(tup, Anum_pg_multiplan_plans_plan_id, tupdesc, &isnull);
+			d_pdata = heap_getattr(tup, Anum_pg_multiplan_plans_plan_data, tupdesc, &isnull);
+
+			if (isnull)
+			{
+				ereport(WARNING,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("skipping plan with null \"%s\" in table \"pg_multiplan_plans\"",
+								"plan_data")));
+				continue;
+			}
+
+			d_qtext = heap_getattr(tup, Anum_pg_multiplan_plans_query_text, tupdesc, &isnull);
+
+			query_id = strtoull(text_to_cstring(DatumGetTextPP(d_qid)), NULL, 10);
+			plan_str = text_to_cstring(DatumGetTextPP(d_pdata));
+			query_tree_str = text_to_cstring(DatumGetTextPP(d_qtree));
+			query_str = isnull ? NULL : text_to_cstring(DatumGetTextPP(d_qtext));
+
+			oldctx = MemoryContextSwitchTo(new_ctx);
+
+			plan = (PlannedStmt *) stringToNode(plan_str);
+
+			cached_plan = palloc(sizeof(CachedPlanEntry));
+			cached_plan->query = (Query *) stringToNode(query_tree_str);
+			cached_plan->query_text = query_str ? pstrdup(query_str) : NULL;
+			cached_plan->stmt = plan;
+
+			entry = hash_search(new_hash, &query_id, HASH_ENTER, &found);
+			if (!found)
+			{
+				entry->plans_list = NIL;
+				entry->selected = 1;
+			}
+
+			entry->plans_list = lappend(entry->plans_list, cached_plan);
+
+			MemoryContextSwitchTo(oldctx);
 		}
 
-		d_qtree = heap_getattr(tup, Anum_pg_multiplan_plans_query_tree, tupdesc, &isnull);
-
-		if (isnull)
-		{
-			ereport(WARNING,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					errmsg("skipping plan with null \"%s\" in table \"pg_multiplan_plans\"",
-							"query_tree")));
-			continue;
-		}
-
-		// d_plan_id = heap_getattr(tup, Anum_pg_multiplan_plans_plan_id, tupdesc, &isnull);
-		d_pdata = heap_getattr(tup, Anum_pg_multiplan_plans_plan_data, tupdesc, &isnull);
-
-		if (isnull)
-		{
-			ereport(WARNING,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					errmsg("skipping plan with null \"%s\" in table \"pg_multiplan_plans\"",
-							"plan_data")));
-			continue;
-		}
-
-		d_qtext = heap_getattr(tup, Anum_pg_multiplan_plans_query_text, tupdesc, &isnull);
-
-		query_id = strtoull(text_to_cstring(DatumGetTextPP(d_qid)), NULL, 10);
-		plan_str = text_to_cstring(DatumGetTextPP(d_pdata));
-		query_tree_str = text_to_cstring(DatumGetTextPP(d_qtree));
-		query_str = isnull ? NULL : text_to_cstring(DatumGetTextPP(d_qtext));
-
-		oldctx = MemoryContextSwitchTo(plan_cache_ctx);
-
-		plan = (PlannedStmt *) stringToNode(plan_str);
-
-		cached_plan = palloc(sizeof(CachedPlanEntry));
-		cached_plan->query = (Query *) stringToNode(query_tree_str);
-		cached_plan->query_text = query_str ? pstrdup(query_str) : NULL;
-		cached_plan->stmt = plan;
-
-		entry = hash_search(hashed_plans, &query_id, HASH_ENTER, &found);
-		if (!found)
-		{
-			entry->plans_list = NIL;
-			entry->selected = 1;
-		}
-
-		entry->plans_list = lappend(entry->plans_list, cached_plan);
-
-		MemoryContextSwitchTo(oldctx);
+		table_endscan(scan);
+		table_close(rel, AccessShareLock);
 	}
-
-	table_endscan(scan);
+	PG_CATCH();
+	{
+		/* error may come from stringToNode while new_ctx is current */
+		MemoryContextSwitchTo(caller_ctx);
+		/* scan, lock and snapshot are released by transaction abort */
+		MemoryContextDelete(new_ctx);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	if (snapshot_set)
 		PopActiveSnapshot();
 
-	table_close(rel, AccessShareLock);
+	/* old hash lives in the old context, so this drops both */
+	if (plan_cache_ctx)
+		MemoryContextDelete(plan_cache_ctx);
+	plan_cache_ctx = new_ctx;
+	hashed_plans = new_hash;
+
+	return true;
 }
 
 static void
@@ -262,17 +308,13 @@ ensure_memory_ctx(void)
 static void
 plan_cache_destroy(void)
 {
-	if (hashed_plans)
+	/* hashed_plans lives in plan_cache_ctx */
+	if (plan_cache_ctx)
 	{
-		hash_destroy(hashed_plans);
+		MemoryContextDelete(plan_cache_ctx);
+		plan_cache_ctx = NULL;
 		hashed_plans = NULL;
 	}
-
-    if (plan_cache_ctx)
-    {
-    	MemoryContextReset(plan_cache_ctx);
-		plan_cache_ctx = NULL;
-    }
 }
 
 static PlannedStmt *
@@ -419,11 +461,9 @@ multiplan_planner_hook(Query *parse,
 		return get_standart_plan(parse, query_string, cursorOptions,
 								 boundParams, es);
 
+	/* retried on next planning until the extension is created */
 	if (!cache_loaded)
-	{
-		load_plans_from_table();
-		cache_loaded = true;
-	}
+		cache_loaded = load_plans_from_table();
 
 	if (parse->queryId == INT64CONST(0))
 		JumbleQuery(parse);
@@ -482,14 +522,8 @@ multiplan_planner_hook(Query *parse,
 void
 _PG_init(void)
 {
-	HASHCTL ctl;
-
 	ensure_memory_ctx();
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(uint64);
-	ctl.entrysize = sizeof(PlanHashEntry);
-
-	hashed_plans = hash_create("pg_multiplan hash table", 128, &ctl, HASH_ELEM | HASH_BLOBS);
+	hashed_plans = create_plans_hash(plan_cache_ctx);
 
 	prev_planner_hook = planner_hook;
 	planner_hook = multiplan_planner_hook;
