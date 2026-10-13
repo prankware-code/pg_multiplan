@@ -16,6 +16,7 @@
 #include "miscadmin.h"
 #include "utils/plancache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/hsearch.h"
@@ -39,7 +40,7 @@ enum
 	Anum_pg_multiplan_plans_plan_data,
 	Anum_pg_multiplan_plans_selected,
 
-	Natts_pg_multiplan_plans = 6 /* number of columns */
+	Natts_pg_multiplan_plans = Anum_pg_multiplan_plans_selected	/* number of columns */
 };
 
 static MemoryContext plan_cache_ctx = NULL;
@@ -104,36 +105,43 @@ get_plans_relid(void)
 static void
 load_plans_from_table(void)
 {
-    Oid            relid;
-    Relation       rel;
-    TableScanDesc  scan;
-    HeapTuple      tup;
-    TupleDesc      tupdesc;
-    MemoryContext  oldctx;
+	Oid				relid;
+	Relation		rel;
+	TableScanDesc	scan;
+	HeapTuple		tup;
+	TupleDesc		tupdesc;
+	MemoryContext	oldctx;
+	bool			snapshot_set = false;
 
-    relid = get_plans_relid();
+	relid = get_plans_relid();
 
-    if (!OidIsValid(relid))
-        return;
+	if (!OidIsValid(relid))
+		return;
 
-    rel = table_open(relid, AccessShareLock);
-    tupdesc = RelationGetDescr(rel);
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		snapshot_set = true;
+	}
 
-    scan = table_beginscan_catalog(rel, 0, NULL);
+	rel = table_open(relid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
 
-    while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-    {
-        Datum   d_qid, d_qtext, d_pdata, d_qtree;
+	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL, SO_NONE);
+
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Datum   d_qid, d_qtext, d_pdata, d_qtree;
 		// Datum d_plan_id;
-        bool    isnull;
-        uint64  query_id;
-        char	*plan_str, *query_str, *query_tree_str;
-        PlannedStmt *plan;
-        PlanHashEntry *entry;
-        bool    found;
+		bool    isnull;
+		uint64  query_id;
+		char	*plan_str, *query_str, *query_tree_str;
+		PlannedStmt *plan;
+		PlanHashEntry *entry;
+		bool    found;
 		CachedPlanEntry *cached_plan;
 
-        d_qid   = heap_getattr(tup, Anum_pg_multiplan_plans_query_id, tupdesc, &isnull);
+		d_qid   = heap_getattr(tup, Anum_pg_multiplan_plans_query_id, tupdesc, &isnull);
 
 		if (isnull)
 		{
@@ -155,9 +163,9 @@ load_plans_from_table(void)
 			continue;
 		}
 
-        // d_plan_id = heap_getattr(tup, Anum_pg_multiplan_plans_plan_id, tupdesc, &isnull);
+		// d_plan_id = heap_getattr(tup, Anum_pg_multiplan_plans_plan_id, tupdesc, &isnull);
 		d_pdata = heap_getattr(tup, Anum_pg_multiplan_plans_plan_data, tupdesc, &isnull);
-		
+
 		if (isnull)
 		{
 			ereport(WARNING,
@@ -167,52 +175,56 @@ load_plans_from_table(void)
 			continue;
 		}
 
-        d_qtext = heap_getattr(tup, Anum_pg_multiplan_plans_query_text, tupdesc, &isnull);
+		d_qtext = heap_getattr(tup, Anum_pg_multiplan_plans_query_text, tupdesc, &isnull);
 
-        query_id = strtoull(text_to_cstring(DatumGetTextPP(d_qid)), NULL, 10);
-        plan_str = text_to_cstring(DatumGetTextPP(d_pdata));
+		query_id = strtoull(text_to_cstring(DatumGetTextPP(d_qid)), NULL, 10);
+		plan_str = text_to_cstring(DatumGetTextPP(d_pdata));
 		query_tree_str = text_to_cstring(DatumGetTextPP(d_qtree));
-        query_str = isnull ? NULL : text_to_cstring(DatumGetTextPP(d_qtext));
+		query_str = isnull ? NULL : text_to_cstring(DatumGetTextPP(d_qtext));
 
-        oldctx = MemoryContextSwitchTo(plan_cache_ctx);
+		oldctx = MemoryContextSwitchTo(plan_cache_ctx);
 
-        plan = (PlannedStmt *) stringToNode(plan_str);
+		plan = (PlannedStmt *) stringToNode(plan_str);
 
 		cached_plan = palloc(sizeof(CachedPlanEntry));
 		cached_plan->query = (Query *) stringToNode(query_tree_str);
 		cached_plan->query_text = query_str ? pstrdup(query_str) : NULL;
 		cached_plan->stmt = plan;
 
-        entry = hash_search(hashed_plans, &query_id, HASH_ENTER, &found);
-        if (!found)
-        {
-            entry->plans_list = NIL;
-            entry->selected = 1;
-        }
+		entry = hash_search(hashed_plans, &query_id, HASH_ENTER, &found);
+		if (!found)
+		{
+			entry->plans_list = NIL;
+			entry->selected = 1;
+		}
 
-        entry->plans_list = lappend(entry->plans_list, cached_plan);
+		entry->plans_list = lappend(entry->plans_list, cached_plan);
 
-        MemoryContextSwitchTo(oldctx);
-    }
+		MemoryContextSwitchTo(oldctx);
+	}
 
-    table_endscan(scan);
-    table_close(rel, AccessShareLock);
+	table_endscan(scan);
+
+	if (snapshot_set)
+		PopActiveSnapshot();
+
+	table_close(rel, AccessShareLock);
 }
 
 static void
 persist_plan(uint64 query_id, const char *query_tree, int64 plan_id,
-             const char *query_text, const char *plan_data)
+			 const char *query_text, const char *plan_data)
 {
-    Oid         relid;
-    Relation    rel;
-    Datum       values[Natts_pg_multiplan_plans];
-    bool        nulls[Natts_pg_multiplan_plans] = {0};
-    HeapTuple   tup;
-    char        qid_buf[32];
+	Oid         relid;
+	Relation    rel;
+	Datum       values[Natts_pg_multiplan_plans];
+	bool        nulls[Natts_pg_multiplan_plans] = {0};
+	HeapTuple   tup;
+	char        qid_buf[32];
 
-    snprintf(qid_buf, sizeof(qid_buf), UINT64_FORMAT, query_id);
+	snprintf(qid_buf, sizeof(qid_buf), UINT64_FORMAT, query_id);
 
-    relid = get_plans_relid();
+	relid = get_plans_relid();
 
 	if (!OidIsValid(relid))
 		ereport(ERROR,
@@ -220,24 +232,24 @@ persist_plan(uint64 query_id, const char *query_tree, int64 plan_id,
 				 errmsg("extension \"pg_multiplan\" is not installed in this database"),
 				 errhint("Run CREATE EXTENSION pg_multiplan, or turn off pg_multiplan.enable_caching.")));
 
-    rel = table_open(relid, RowExclusiveLock);
+	rel = table_open(relid, RowExclusiveLock);
 
-    values[Anum_pg_multiplan_plans_query_id - 1] = CStringGetTextDatum(qid_buf);
+	values[Anum_pg_multiplan_plans_query_id - 1] = CStringGetTextDatum(qid_buf);
 	values[Anum_pg_multiplan_plans_query_tree - 1] = CStringGetTextDatum(query_tree);
-    values[Anum_pg_multiplan_plans_plan_id - 1] = Int64GetDatum(plan_id);
+	values[Anum_pg_multiplan_plans_plan_id - 1] = Int64GetDatum(plan_id);
 	if (query_text)
 		values[Anum_pg_multiplan_plans_query_text - 1] = CStringGetTextDatum(query_text);
 	else
 		nulls[Anum_pg_multiplan_plans_query_text - 1] = true;
-    values[Anum_pg_multiplan_plans_plan_data - 1] = CStringGetTextDatum(plan_data);
-    values[Anum_pg_multiplan_plans_selected - 1] = BoolGetDatum(false);
+	values[Anum_pg_multiplan_plans_plan_data - 1] = CStringGetTextDatum(plan_data);
+	values[Anum_pg_multiplan_plans_selected - 1] = BoolGetDatum(false);
 
-    tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
-    simple_heap_insert(rel, tup);
+	simple_heap_insert(rel, tup);
 
-    heap_freetuple(tup);
-    table_close(rel, RowExclusiveLock);
+	heap_freetuple(tup);
+	table_close(rel, RowExclusiveLock);
 }
 
 static void
